@@ -250,7 +250,7 @@ def forward_kinematics(theta, model):
 # ============================================================================
 
 def inverse_kinematics(T_desired, theta0, model, max_iter=60, eps_w=1e-5, eps_v=1e-4):
-    """Newton-Raphson body-frame IK (matches MATLAB structure).
+    """Newton-Raphson body-frame IK (matches MATLAB structure given in Lab2).
 
     This is a direct port of the MATLAB IK routine. It uses the body
     Jacobian and matrix logarithm to iteratively converge on joint angles.

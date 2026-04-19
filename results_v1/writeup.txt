@@ -1,0 +1,320 @@
+================================================================================
+    DEEP NEURAL NETWORK-INITIALIZED INVERSE KINEMATICS FOR THE UR5e ROBOT ARM
+                         Results & Findings (v1 Baseline)
+================================================================================
+
+Authors: Robert S.
+Date: April 2026
+Project: ES 259 Final Project
+
+
+1. ABSTRACT
+--------------------------------------------------------------------------------
+
+This work presents a seed-conditioned deep neural network (DNN) for initializing
+iterative inverse kinematics (IK) solvers on the Universal Robots UR5e 6-DOF
+manipulator. By training a DNN to predict approximate joint configurations from
+a target end-effector pose and the robot's current joint state, and then
+refining the prediction with a Newton-Raphson solver, we achieve a 5.7x speedup
+in convergence and a 78% relative improvement in convergence rate compared to
+random initialization. This approach bridges the gap between fast but
+approximate learned methods and precise but slow numerical methods.
+
+
+2. PROBLEM STATEMENT
+--------------------------------------------------------------------------------
+
+Inverse kinematics (IK) is the problem of finding joint angles q = [q1,...,q6]
+such that the forward kinematics FK(q) produces a desired end-effector pose
+T_target (a 4x4 homogeneous transformation matrix encoding position and
+orientation in SE(3)).
+
+For the UR5e, this is a 6-DOF problem with:
+  - Up to 8 valid IK solutions (branches) for a single target pose
+  - Kinematic singularities where the Jacobian loses rank
+  - A non-convex solution space where iterative solvers can get trapped
+
+Traditional numerical solvers (Newton-Raphson, Levenberg-Marquardt) require an
+initial joint estimate. Poor initialization leads to:
+  (a) Convergence to the wrong IK branch
+  (b) Slow convergence (many iterations)
+  (c) Failure to converge entirely
+
+Our approach: train a DNN to provide a high-quality initial estimate, then
+refine it with a classical numerical solver.
+
+
+3. METHODOLOGY
+--------------------------------------------------------------------------------
+
+3.1 Robot Model
+
+  Robot:          Universal Robots UR5e
+  DOF:            6 revolute joints
+  Kinematics:     Product of Exponentials formulation
+  Joint limits:   [-pi, +pi] for all joints
+  Link lengths:   L1=425mm, L2=392.2mm, H1=162.5mm, H2=99.7mm,
+                  W1=133.3mm, W2=259.6mm
+  Max reach:      ~850mm
+
+3.2 Dataset Generation
+
+  Method:         Random joint sampling with FK computation
+  Seed strategy:  Gaussian noise (sigma=0.5 rad) added to ground truth joints
+                  to simulate "current configuration" conditioning
+  Columns (21):   [x, y, z, r6d_0..r6d_5, seed_q1..seed_q6, q1..q6]
+  Total samples:  6,342,530
+  Data split:     80% train / 10% validation / 10% test
+  File size:      1.36 GB (CSV)
+
+  Pose representation: 9D = 3D position (mm) + 6D continuous rotation
+    The 6D rotation representation (Zhou et al., 2019) uses the first two
+    columns of the rotation matrix, avoiding gimbal lock and discontinuity
+    issues inherent to Euler angles and quaternions.
+
+  Joint representation: 12D = sin/cos encoding of 6 joint angles
+    Each joint angle theta_i is encoded as [sin(theta_i), cos(theta_i)],
+    eliminating the discontinuity at +/-pi.
+
+3.3 Network Architecture
+
+  Model:          SeedConditionedIKModel
+  Type:           Fully connected deep neural network (MLP)
+  Input:          15D (9D scaled pose + 6D scaled seed joints)
+  Output:         12D (sin/cos pairs for 6 joints)
+
+  Architecture:
+    Layer 1:  Linear(15, 256)   + BatchNorm + Mish activation
+    Layer 2:  Linear(256, 512)  + BatchNorm + Mish activation
+    Layer 3:  Linear(512, 512)  + BatchNorm + Mish + residual skip connection
+    Layer 4:  Linear(768, 256)  + BatchNorm + Mish (768 = 512 + 256 skip from L1)
+    Output:   Linear(256, 12)
+
+  Total trainable parameters: 535,820
+  Activation function:        Mish (smooth, non-monotonic)
+  Normalization:              BatchNorm after each linear layer
+  Skip connections:           Residual in block 3, skip from block 1 to block 4
+
+3.4 Training Configuration
+
+  Optimizer:       Adam (lr=1e-3)
+  Loss function:   NormalizedSinCosLoss
+                   (L2-normalizes sin/cos pairs before computing MSE)
+  Batch size:      2,048
+  Epochs:          150
+  LR scheduler:    ReduceLROnPlateau (factor=0.5, patience=5)
+  Early stopping:  Patience=20 (not triggered; ran full 150 epochs)
+  Gradient clip:   Max norm = 1.0
+  Input scaling:   StandardScaler applied separately to pose and seed features
+  Hardware:        CPU (no GPU acceleration)
+  Training time:   ~7 hours
+
+3.5 Numerical IK Solver (for refinement)
+
+  Algorithm:       Newton-Raphson with Damped Least Squares
+  Jacobian:        Spatial Jacobian via Product of Exponentials
+  Update rule:     dq = J^T (J J^T + lambda^2 I)^{-1} * error
+  Damping:         lambda^2 = 1e-4
+  Step clamping:   Max |dq_i| = 0.5 rad per iteration
+  Convergence:     Position error < 1mm AND rotation error < 0.01 rad (0.57 deg)
+  Max iterations:  200
+
+
+4. RESULTS
+--------------------------------------------------------------------------------
+
+4.1 DNN Training Performance
+
+  Best validation loss:     0.005290 (epoch 148)
+  Test MAE:                 0.0522 rad (2.99 degrees)
+  Final learning rate:      7.8125e-6 (reduced 7 times)
+
+  Per-joint test MAE (degrees):
+    Joint 1 (base):         1.69 deg
+    Joint 2 (shoulder):     3.29 deg
+    Joint 3 (elbow):        3.66 deg
+    Joint 4 (wrist 1):      4.69 deg
+    Joint 5 (wrist 2):      1.63 deg
+    Joint 6 (wrist 3):      3.00 deg
+
+  Error distribution:
+    < 1 degree:             40.4% of predictions
+    < 5 degrees:            84.9% of predictions
+    < 10 degrees:           93.4% of predictions
+
+4.2 IK Solver Benchmark (100 random target poses)
+
+  Metric                    DNN-Initialized     Random-Initialized (best of 5)
+  -------------------------------------------------------------------------
+  Convergence rate          73 / 100 (73%)       41 / 100 (41%)
+  Average iterations        7.2                  41.3
+  Median iterations         6                    28
+  P90 iterations            10                   78
+  Min iterations            3                    13
+  Max iterations            40                   139
+  -------------------------------------------------------------------------
+  Speedup (median):         4.7x
+  Speedup (average):        5.7x
+  Iterations saved/solve:   ~34
+
+  Notes:
+    - Random initialization used best-of-5 strategy (5 random starts in
+      [-pi, pi]^6, taking the one that converged first), which is already
+      more generous than a single random start.
+    - DNN initialization used a single forward pass (~0.5ms) per solve.
+    - Convergence defined as: position error < 1mm AND rotation error < 0.57 deg.
+
+4.3 Position and Orientation Accuracy (DNN only, before refinement)
+
+  Across 10 random FK-generated test poses:
+    Position error range:   9.6 mm  -  67.3 mm
+    Rotation error range:   1.7 deg -  9.5 deg
+
+  These errors are too large for direct use but place the solution firmly
+  within the convergence basin of Newton-Raphson, enabling rapid refinement.
+
+
+5. COMPARISON WITH EXISTING IK METHODS
+--------------------------------------------------------------------------------
+
+5.1 Pure Numerical Solvers (Newton-Raphson, Levenberg-Marquardt)
+
+  These are the standard approach in robotics libraries (KDL, Orocos).
+
+  Advantages over our approach:
+    - No training required
+    - No dataset needed
+    - Mathematically well-understood
+
+  Disadvantages:
+    - Convergence depends entirely on initialization quality
+    - Single random start: ~8% convergence rate (from our baseline tests)
+    - Best-of-5 random starts: 41% convergence rate
+    - No awareness of which IK branch is most relevant
+    - Median 28 iterations per solve (with best-of-5)
+
+  Our improvement:
+    - 73% convergence rate (+78% relative improvement)
+    - Median 6 iterations (5.7x faster)
+    - DNN automatically selects the correct IK branch based on current config
+
+5.2 IKFast (Analytical/Closed-Form)
+
+  IKFast (OpenRAVE) computes closed-form IK solutions using symbolic elimination.
+
+  Advantages over our approach:
+    - Exact solution, no iterations needed
+    - Returns ALL valid solutions (up to 8)
+    - Deterministic, ~microsecond solve time
+
+  Disadvantages:
+    - Only works for specific kinematic structures (6-DOF with spherical wrist)
+    - Requires complex offline symbolic computation per robot
+    - Cannot handle robots with non-standard geometries
+    - Does not rank solutions by proximity to current configuration
+
+  Our improvement:
+    - Works for ANY robot kinematic chain (just regenerate training data)
+    - Seed conditioning naturally selects the closest solution
+    - Generalizable to redundant robots (7+ DOF) where closed-form is impossible
+
+5.3 TRAC-IK (State of the Art for Numerical IK)
+
+  TRAC-IK runs Newton-Raphson and Sequential Quadratic Programming (SQP)
+  in parallel with random restarts, returning the first solution found.
+
+  Advantages over our approach:
+    - Higher convergence rate (~99.5% reported)
+    - Production-tested in ROS/MoveIt
+    - SQP fallback handles difficult configurations
+
+  Disadvantages:
+    - Random restarts are computationally expensive
+    - No learning from previous solves
+    - Each solve is independent (no context from current configuration)
+
+  Our improvement:
+    - DNN provides informed initialization (not random)
+    - Could be integrated INTO TRAC-IK as the first candidate, reducing
+      the number of random restarts needed
+    - Amortized computation: training is offline, inference is ~0.5ms
+
+5.4 Pure Deep Learning IK (IKNet, IKFlow, etc.)
+
+  End-to-end neural networks that directly output joint angles without
+  numerical refinement.
+
+  Advantages over our approach:
+    - Single forward pass, no iterative refinement
+    - Faster inference (~0.5ms vs ~0.5ms + 6 iterations)
+
+  Disadvantages:
+    - Accuracy limited to ~3-5 degrees (insufficient for most applications)
+    - Position errors of 10-70mm (unacceptable for manipulation tasks)
+    - No guaranteed convergence to exact solution
+    - Requires retraining for different accuracy requirements
+
+  Our improvement:
+    - Guaranteed precision when converged (< 1mm position, < 0.57 deg rotation)
+    - Combines speed of learning with precision of numerical methods
+    - Best of both worlds: fast approximate + exact refinement
+
+
+6. INDUSTRY IMPACT & FUTURE DIRECTIONS
+--------------------------------------------------------------------------------
+
+6.1 How This Improves Industry-Level IK
+
+  (a) Reduced Computation in Real-Time Control
+      Industrial robots running at 1kHz control loops need IK solutions in
+      under 1ms. Our DNN provides a warm start in ~0.5ms, and Newton-Raphson
+      converges in 6 iterations (vs 28). For real-time trajectory tracking,
+      this reduces CPU load by ~80%.
+
+  (b) Integration with Existing Stacks
+      The DNN initializer can be dropped into any existing IK pipeline:
+        - ROS/MoveIt: Replace random seed in KDL or TRAC-IK
+        - Industrial controllers: Warm-start proprietary IK solvers
+        - Motion planning: Provide IK hints for sampling-based planners (RRT/PRM)
+
+  (c) Redundant Robots (7+ DOF)
+      For robots like the KUKA iiwa (7-DOF) or bimanual systems, analytical IK
+      is impossible. Numerical IK with random starts is unreliable. A learned
+      initializer becomes essential, and our architecture generalizes directly.
+
+  (d) Multi-Robot and Changing Environments
+      Transfer learning can adapt a trained model to robot variants or
+      tool changes without full retraining. The seed-conditioning naturally
+      handles path-dependent IK (selecting solutions close to current config).
+
+6.2 Future Work
+
+  (a) Scale to 10M+ data points to improve accuracy and convergence rate
+  (b) GPU-accelerated training for faster iteration
+  (c) Multi-start DNN: predict top-K candidate solutions, refine all in parallel
+  (d) Integrate DNN + Newton-Raphson into a single differentiable pipeline
+  (e) Evaluate on real UR5e hardware with trajectory tracking benchmarks
+  (f) Benchmark against TRAC-IK directly (requires Linux/ROS environment)
+  (g) Test on redundant 7-DOF robots (KUKA iiwa, Franka Emika Panda)
+
+
+7. CONFIGURATION SUMMARY (for reproducibility)
+--------------------------------------------------------------------------------
+
+  Dataset file:       ik_v3/ur5e_seed_10m.csv
+  Model checkpoint:   ik_v3/results/model_best.pt
+  Pose scaler:        ik_v3/results/pose_scaler.pkl
+  Seed scaler:        ik_v3/results/seed_scaler.pkl
+  Training history:   ik_v3/results/training_history.csv
+  Training curves:    ik_v3/results/training_curves.png
+  Test indices:       ik_v3/results/test_indices.npy
+  Benchmark script:   benchmark_ik2.py
+
+  Python version:     3.14
+  PyTorch version:    2.x
+  Platform:           Windows 11, CPU-only
+
+
+================================================================================
+                              END OF REPORT (v1)
+================================================================================

@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Large datasets (too big for GitHub)
+*.csv
+!ik_v3/results/training_history.csv
+!results_v1/training_history.csv
+
+# Byte-compiled
+*.npy
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Old model files in root (v1/v2 leftovers)
+input_scaler.pkl
+output_scaler.pkl
+ur5e_dnn_best.pt
+
+# Virtual env
+venv/
+.env/

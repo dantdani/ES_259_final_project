@@ -3,7 +3,7 @@
                          Results & Findings (v1 Baseline)
 ================================================================================
 
-Authors: Robert S.
+Authors: Dandi Desta
 Date: April 2026
 Project: ES 259 Final Project
 
@@ -163,6 +163,34 @@ refine it with a classical numerical solver.
       more generous than a single random start.
     - DNN initialization used a single forward pass (~0.5ms) per solve.
     - Convergence defined as: position error < 1mm AND rotation error < 0.57 deg.
+
+4.2b Scaling Test: IK Solver Benchmark (1000 random target poses)
+
+  To validate that the results hold at scale, the benchmark was re-run with
+  10x the number of test poses.
+
+  Metric                    DNN-Initialized     Random-Initialized (best of 5)
+  -------------------------------------------------------------------------
+  Convergence rate          774 / 1000 (77%)     439 / 1000 (44%)
+  Average iterations        9.3                  45.7
+  Median iterations         7                    30
+  -------------------------------------------------------------------------
+  Speedup (median):         4.3x
+  Speedup (average):        4.9x
+
+  Comparison (100 vs 1000 poses):
+    Metric                  100 poses            1000 poses
+    -----------------------------------------------------------
+    DNN convergence         73%                  77%  (+4pp)
+    Random convergence      41%                  44%  (+3pp)
+    DNN median iters        6                    7
+    Random median iters     28                   30
+    Speedup (avg)           5.7x                 4.9x
+
+  The results scale consistently. With a larger sample, convergence rates
+  improved slightly (likely statistical noise evening out), and the DNN
+  approach maintained ~5x fewer iterations and nearly 2x better convergence
+  reliability than random initialization.
 
 4.3 Position and Orientation Accuracy (DNN only, before refinement)
 

@@ -144,7 +144,7 @@ def ik_newton(T_target, q_init, model, max_iter=200, eps_v=1.0, eps_w=0.01):
 
 
 # ===================== BENCHMARK =====================
-N = 100
+N = 1000
 eps_v = 1.0    # 1 mm position
 eps_w = 0.01   # ~0.57 deg rotation
 
@@ -174,7 +174,7 @@ for i in range(N):
             best_rand = (iters2, pe2, re2, conv2)
     rand_results.append(best_rand)
 
-    if (i+1) % 25 == 0:
+    if (i+1) % 100 == 0:
         print(f"  Progress: {i+1}/{N}")
 
 elapsed = time.time() - t0
@@ -221,10 +221,10 @@ print()
 
 # Individual examples
 print("-" * 65)
-print(f"  First 20 individual results:")
+print(f"  First 30 individual results:")
 hdr = f"  {'#':>3}  {'DNN it':>7} {'DNN':>4} {'pos_mm':>7}  {'Rnd it':>7} {'Rnd':>4} {'pos_mm':>7}"
 print(hdr)
-for i in range(min(20, N)):
+for i in range(min(30, N)):
     d = dnn_results[i]; r = rand_results[i]
     dc = "YES" if d[3] else "no"
     rc = "YES" if r[3] else "no"

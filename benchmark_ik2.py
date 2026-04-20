@@ -1,4 +1,6 @@
 """Benchmark: DNN-init vs Random-init with textbook Newton-Raphson IK."""
+import argparse
+import json
 import os, numpy as np, sys, time
 
 PROJECT = os.path.dirname(os.path.abspath(__file__))
@@ -8,8 +10,6 @@ sys.path.insert(0, PROJECT)
 from ik_v3.infer import IKSolver
 from utils import build_ur5e_model, forward_kinematics, skew
 
-np.random.seed(42)
-solver = IKSolver('ik_v3/results', device='cpu')
 ur5e = build_ur5e_model()
 
 
@@ -143,89 +143,195 @@ def ik_newton(T_target, q_init, model, max_iter=200, eps_v=1.0, eps_w=0.01):
     return q, max_iter, np.linalg.norm(dp), np.degrees(angle), False
 
 
-# ===================== BENCHMARK =====================
-N = 1000
-eps_v = 1.0    # 1 mm position
-eps_w = 0.01   # ~0.57 deg rotation
+def _stats(results, total_samples):
+    conv = sum(1 for r in results if r[3])
+    iters_conv = [r[0] for r in results if r[3]]
+    stats = {
+        "converged": int(conv),
+        "failed": int(total_samples - conv),
+        "convergence_percent": float(100.0 * conv / total_samples),
+    }
+    if iters_conv:
+        pct = np.percentile(iters_conv, [25, 50, 75, 90])
+        stats.update({
+            "avg_iterations": float(np.mean(iters_conv)),
+            "median_iterations": int(np.median(iters_conv)),
+            "min_iterations": int(min(iters_conv)),
+            "max_iterations": int(max(iters_conv)),
+            "p25_iterations": int(pct[0]),
+            "p50_iterations": int(pct[1]),
+            "p75_iterations": int(pct[2]),
+            "p90_iterations": int(pct[3]),
+        })
+    return stats
 
-dnn_results = []
-rand_results = []
 
-t0 = time.time()
-for i in range(N):
-    q_true = np.random.uniform(-np.pi, np.pi, 6).astype(np.float32)
-    T_target = forward_kinematics(q_true, ur5e)
+def run_benchmark(model_dir, num_samples=1000, seed=42, device="cpu"):
+    np.random.seed(seed)
+    solver = IKSolver(model_dir, device=device)
 
-    # --- DNN init (single shot) ---
-    q_seed = q_true + np.random.randn(6).astype(np.float32) * 0.5
-    q_seed = np.clip(q_seed, -np.pi, np.pi)
-    q_dnn = solver.solve(T_target, q_seed)
-    _, iters, pe, re, conv = ik_newton(T_target, q_dnn, ur5e, eps_v=eps_v, eps_w=eps_w)
-    dnn_results.append((iters, pe, re, conv))
+    eps_v = 1.0    # 1 mm position
+    eps_w = 0.01   # ~0.57 deg rotation
+    dnn_results = []
+    rand_results = []
 
-    # --- Random init (best of 5 restarts) ---
-    best_rand = (200, 999.0, 999.0, False)
-    for _ in range(5):
-        q_rand = np.random.uniform(-np.pi, np.pi, 6)
-        _, iters2, pe2, re2, conv2 = ik_newton(T_target, q_rand, ur5e, eps_v=eps_v, eps_w=eps_w)
-        if conv2 and (not best_rand[3] or iters2 < best_rand[0]):
-            best_rand = (iters2, pe2, re2, conv2)
-        elif not best_rand[3] and pe2 < best_rand[1]:
-            best_rand = (iters2, pe2, re2, conv2)
-    rand_results.append(best_rand)
+    t0 = time.time()
+    for i in range(num_samples):
+        q_true = np.random.uniform(-np.pi, np.pi, 6).astype(np.float32)
+        T_target = forward_kinematics(q_true, ur5e)
 
-    if (i+1) % 100 == 0:
-        print(f"  Progress: {i+1}/{N}")
+        q_seed = q_true + np.random.randn(6).astype(np.float32) * 0.5
+        q_seed = np.clip(q_seed, -np.pi, np.pi)
+        q_dnn = solver.solve(T_target, q_seed)
+        _, iters, pe, re, conv = ik_newton(
+            T_target, q_dnn, ur5e, eps_v=eps_v, eps_w=eps_w)
+        dnn_results.append((int(iters), float(pe), float(re), bool(conv)))
 
-elapsed = time.time() - t0
+        best_rand = (200, 999.0, 999.0, False)
+        for _ in range(5):
+            q_rand = np.random.uniform(-np.pi, np.pi, 6)
+            _, iters2, pe2, re2, conv2 = ik_newton(
+                T_target, q_rand, ur5e, eps_v=eps_v, eps_w=eps_w)
+            if conv2 and (not best_rand[3] or iters2 < best_rand[0]):
+                best_rand = (iters2, pe2, re2, conv2)
+            elif not best_rand[3] and pe2 < best_rand[1]:
+                best_rand = (iters2, pe2, re2, conv2)
+        rand_results.append(
+            (int(best_rand[0]), float(best_rand[1]), float(best_rand[2]), bool(best_rand[3])))
 
-dnn_conv = sum(1 for r in dnn_results if r[3])
-rand_conv = sum(1 for r in rand_results if r[3])
-dnn_iters_conv = [r[0] for r in dnn_results if r[3]]
-rand_iters_conv = [r[0] for r in rand_results if r[3]]
+        if (i + 1) % 100 == 0:
+            print(f"  Progress: {i+1}/{num_samples}")
 
-print()
-print("=" * 65)
-print(f"  IK SOLVER BENCHMARK ({N} random targets)")
-print(f"  Newton-Raphson + Damped Least Squares + Step Clamping")
-print(f"  Tolerance: {eps_v} mm position, {np.degrees(eps_w):.2f} deg rotation")
-print(f"  Max iterations: 200 | Random uses best-of-5 restarts")
-print(f"  Time: {elapsed:.1f}s")
-print("=" * 65)
-print()
-print(f"  DNN-Initialized (1 DNN call + Newton polish):")
-print(f"    Convergence rate:    {dnn_conv}/{N} ({100*dnn_conv/N:.0f}%)")
-if dnn_iters_conv:
-    print(f"    Avg iterations:      {np.mean(dnn_iters_conv):.1f}")
-    print(f"    Median iterations:   {int(np.median(dnn_iters_conv))}")
-    print(f"    Min / Max:           {min(dnn_iters_conv)} / {max(dnn_iters_conv)}")
-    pct = np.percentile(dnn_iters_conv, [25, 50, 75, 90])
-    print(f"    Percentiles:         P25={int(pct[0])} P50={int(pct[1])} P75={int(pct[2])} P90={int(pct[3])}")
-print()
-print(f"  Random-Initialized (best of 5 restarts):")
-print(f"    Convergence rate:    {rand_conv}/{N} ({100*rand_conv/N:.0f}%)")
-if rand_iters_conv:
-    print(f"    Avg iterations:      {np.mean(rand_iters_conv):.1f}")
-    print(f"    Median iterations:   {int(np.median(rand_iters_conv))}")
-    print(f"    Min / Max:           {min(rand_iters_conv)} / {max(rand_iters_conv)}")
-    pct = np.percentile(rand_iters_conv, [25, 50, 75, 90])
-    print(f"    Percentiles:         P25={int(pct[0])} P50={int(pct[1])} P75={int(pct[2])} P90={int(pct[3])}")
-print()
-if dnn_iters_conv and rand_iters_conv:
-    print(f"  SPEEDUP: {np.mean(rand_iters_conv)/np.mean(dnn_iters_conv):.1f}x fewer iters (DNN vs Random)")
-    print(f"  SAVED:   ~{np.mean(rand_iters_conv)-np.mean(dnn_iters_conv):.0f} iterations per solve")
-elif dnn_iters_conv:
-    print(f"  Random NEVER converged. DNN avg = {np.mean(dnn_iters_conv):.1f} iters")
-print(f"  RELIABILITY: DNN {dnn_conv} vs Random {rand_conv} converged out of {N}")
-print()
+    elapsed = time.time() - t0
+    dnn_stats = _stats(dnn_results, num_samples)
+    rand_stats = _stats(rand_results, num_samples)
 
-# Individual examples
-print("-" * 65)
-print(f"  First 30 individual results:")
-hdr = f"  {'#':>3}  {'DNN it':>7} {'DNN':>4} {'pos_mm':>7}  {'Rnd it':>7} {'Rnd':>4} {'pos_mm':>7}"
-print(hdr)
-for i in range(min(30, N)):
-    d = dnn_results[i]; r = rand_results[i]
-    dc = "YES" if d[3] else "no"
-    rc = "YES" if r[3] else "no"
-    print(f"  {i+1:>3}  {d[0]:>7}  {dc:>4} {d[1]:>7.2f}  {r[0]:>7}  {rc:>4} {r[1]:>7.2f}")
+    summary = {
+        "model_dir": model_dir,
+        "num_samples": int(num_samples),
+        "seed": int(seed),
+        "device": device,
+        "tolerance_position_mm": float(eps_v),
+        "tolerance_rotation_deg": float(np.degrees(eps_w)),
+        "elapsed_seconds": float(elapsed),
+        "dnn": dnn_stats,
+        "random": rand_stats,
+    }
+    if dnn_stats.get("avg_iterations") and rand_stats.get("avg_iterations"):
+        summary["speedup_x"] = float(
+            rand_stats["avg_iterations"] / dnn_stats["avg_iterations"])
+        summary["saved_iterations"] = float(
+            rand_stats["avg_iterations"] - dnn_stats["avg_iterations"])
+    return summary, dnn_results, rand_results
+
+
+def print_summary(summary, dnn_results, rand_results):
+    num_samples = summary["num_samples"]
+    dnn_stats = summary["dnn"]
+    rand_stats = summary["random"]
+
+    print()
+    print("=" * 65)
+    print(f"  IK SOLVER BENCHMARK ({num_samples} random targets)")
+    print("  Newton-Raphson + Damped Least Squares + Step Clamping")
+    print(
+        f"  Model dir: {summary['model_dir']} | Device: {summary['device']}")
+    print(
+        f"  Tolerance: {summary['tolerance_position_mm']} mm position, {summary['tolerance_rotation_deg']:.2f} deg rotation")
+    print("  Max iterations: 200 | Random uses best-of-5 restarts")
+    print(f"  Time: {summary['elapsed_seconds']:.1f}s")
+    print("=" * 65)
+    print()
+    print("  DNN-Initialized (1 DNN call + Newton polish):")
+    print(
+        f"    Convergence rate:    {dnn_stats['converged']}/{num_samples} ({dnn_stats['convergence_percent']:.0f}%)")
+    if "avg_iterations" in dnn_stats:
+        print(f"    Avg iterations:      {dnn_stats['avg_iterations']:.1f}")
+        print(f"    Median iterations:   {dnn_stats['median_iterations']}")
+        print(
+            f"    Min / Max:           {dnn_stats['min_iterations']} / {dnn_stats['max_iterations']}")
+        print(
+            f"    Percentiles:         P25={dnn_stats['p25_iterations']} P50={dnn_stats['p50_iterations']} P75={dnn_stats['p75_iterations']} P90={dnn_stats['p90_iterations']}")
+    print()
+    print("  Random-Initialized (best of 5 restarts):")
+    print(
+        f"    Convergence rate:    {rand_stats['converged']}/{num_samples} ({rand_stats['convergence_percent']:.0f}%)")
+    if "avg_iterations" in rand_stats:
+        print(f"    Avg iterations:      {rand_stats['avg_iterations']:.1f}")
+        print(f"    Median iterations:   {rand_stats['median_iterations']}")
+        print(
+            f"    Min / Max:           {rand_stats['min_iterations']} / {rand_stats['max_iterations']}")
+        print(
+            f"    Percentiles:         P25={rand_stats['p25_iterations']} P50={rand_stats['p50_iterations']} P75={rand_stats['p75_iterations']} P90={rand_stats['p90_iterations']}")
+    print()
+    if "speedup_x" in summary:
+        print(
+            f"  SPEEDUP: {summary['speedup_x']:.1f}x fewer iters (DNN vs Random)")
+        print(
+            f"  SAVED:   ~{summary['saved_iterations']:.0f} iterations per solve")
+    elif "avg_iterations" in dnn_stats:
+        print(
+            f"  Random NEVER converged. DNN avg = {dnn_stats['avg_iterations']:.1f} iters")
+    print(
+        f"  RELIABILITY: DNN {dnn_stats['converged']} vs Random {rand_stats['converged']} converged out of {num_samples}")
+    print()
+    print("-" * 65)
+    print("  First 30 individual results:")
+    hdr = (
+        f"  {'#':>3}  {'DNN it':>7} {'DNN':>4} {'pos_mm':>7}  {'Rnd it':>7} {'Rnd':>4} {'pos_mm':>7}")
+    print(hdr)
+    for i in range(min(30, num_samples)):
+        d = dnn_results[i]
+        r = rand_results[i]
+        dc = "YES" if d[3] else "no"
+        rc = "YES" if r[3] else "no"
+        print(
+            f"  {i+1:>3}  {d[0]:>7}  {dc:>4} {d[1]:>7.2f}  {r[0]:>7}  {rc:>4} {r[1]:>7.2f}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Benchmark DNN-initialized IK against random restarts")
+    parser.add_argument("--model_dir", type=str, default="ik_v3/results")
+    parser.add_argument("--num_samples", type=int, default=1000)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--output_json", type=str, default=None)
+    args = parser.parse_args()
+
+    summary, dnn_results, rand_results = run_benchmark(
+        model_dir=args.model_dir,
+        num_samples=args.num_samples,
+        seed=args.seed,
+        device=args.device,
+    )
+    print_summary(summary, dnn_results, rand_results)
+
+    if args.output_json:
+        payload = {
+            "summary": summary,
+            "first_30_examples": [
+                {
+                    "index": i + 1,
+                    "dnn": {
+                        "iterations": dnn_results[i][0],
+                        "position_error_mm": dnn_results[i][1],
+                        "rotation_error_deg": dnn_results[i][2],
+                        "converged": dnn_results[i][3],
+                    },
+                    "random": {
+                        "iterations": rand_results[i][0],
+                        "position_error_mm": rand_results[i][1],
+                        "rotation_error_deg": rand_results[i][2],
+                        "converged": rand_results[i][3],
+                    },
+                }
+                for i in range(min(30, summary["num_samples"]))
+            ],
+        }
+        with open(args.output_json, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+
+if __name__ == "__main__":
+    main()

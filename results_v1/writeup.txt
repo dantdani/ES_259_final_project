@@ -343,6 +343,726 @@ refine it with a classical numerical solver.
   Platform:           Windows 11, CPU-only
 
 
+8. FUNCTION & MODULE REFERENCE
+================================================================================
+
+This section documents every function and class in the codebase, organized
+by file. For each function: what it does, its inputs/outputs, and when to
+use it.
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.1  utils.py  —  Shared Utilities
+────────────────────────────────────────────────────────────────────────────────
+
+  Constants / column lists:
+    DEFAULT_JOINT_LIMITS   – list of 6 (lo, hi) tuples, all [-pi, pi].
+    JOINT_COLS             – ["q1", ..., "q6"]
+    POSITION_COLS          – ["x", "y", "z"]
+    ROTATION_COLS          – ["r11", "r12", ..., "r33"]  (full 3x3 rotation)
+    POSE_COLS              – POSITION_COLS + ROTATION_COLS  (12 columns)
+    SINCOS_COLS            – ["sin_q1", "cos_q1", ..., "sin_q6", "cos_q6"]
+
+  skew(v) -> (3,3) ndarray
+    Builds the 3x3 skew-symmetric matrix [v]× from a 3-vector.
+    Use: internal helper for exp_rot, g_func, screw_exp, adjoint.
+
+  exp_rot(w_hat, theta) -> (3,3) ndarray
+    Rodrigues' formula: computes exp([w]*theta), the rotation matrix for
+    rotating theta radians about the unit axis whose skew matrix is w_hat.
+    Use: called inside screw_exp to compute the rotation part of a screw.
+
+  g_func(w_hat, theta) -> (3,3) ndarray
+    Computes the translation-related matrix G(theta) used in the Product of
+    Exponentials formulation. G = I*theta + (1-cos)*[w] + (theta-sin)*[w]^2.
+    Use: called inside screw_exp to compute the translation part.
+
+  screw_exp(w, v, theta) -> (4,4) ndarray
+    Computes the 4x4 homogeneous transform for a screw motion: a rotation
+    of theta about axis w plus a translation. This is exp([S]*theta) where
+    S = [w; v] is a screw axis.
+    Inputs: w (3,) angular axis, v (3,) linear axis, theta (float) angle.
+    Use: the building block of Product-of-Exponentials FK. Called once per
+    joint to build each joint's contribution to the FK chain.
+
+  adjoint(T) -> (6,6) ndarray
+    Computes the 6x6 adjoint representation of a 4x4 homogeneous transform.
+    Ad(T) = [[R, 0]; [[p]×R, R]]. Used to transform screw axes between frames.
+    Use: converting space screws to body screws in build_ur5e_model(), and
+    in the Jacobian computation for IK solvers.
+
+  build_ur5e_model() -> dict
+    Constructs the full UR5e kinematic model. Returns a dictionary with:
+      - w (6,3): angular screw axes for each joint
+      - v (6,3): linear screw axes for each joint
+      - S (6,6): space-frame screw axes [w | v]
+      - B (6,6): body-frame screw axes
+      - M (4,4): home configuration (FK at zero joints)
+      - Link dimensions: W1, W2, H1, H2, L1, L2 (all in mm)
+    Use: CALL THIS FIRST. Every other function that does FK or IK needs
+    this model dictionary. Call once and reuse — it's deterministic.
+
+  forward_kinematics(theta, model) -> (4,4) ndarray
+    Computes the end-effector pose T = exp(S1*th1)*...*exp(S6*th6)*M using
+    the space-frame Product of Exponentials formulation.
+    Inputs: theta (6,) joint angles in radians, model from build_ur5e_model().
+    Output: 4x4 homogeneous transform (rotation + position in mm).
+    Use: whenever you need to know where the end-effector is given joint
+    angles. Used in dataset generation, IK verification, benchmarks.
+
+  encode_sincos(joints) -> (..., 12) ndarray
+    Encodes 6 joint angles as 12 interleaved sin/cos pairs:
+    [sin(q1), cos(q1), sin(q2), cos(q2), ..., sin(q6), cos(q6)].
+    This eliminates the discontinuity at ±pi that hurts neural net training.
+    Use: preparing training targets. Raw joint angles -> sin/cos for the
+    network to predict.
+
+  decode_sincos(sincos) -> (..., 6) ndarray
+    Inverse of encode_sincos. Uses atan2 to recover joint angles from
+    sin/cos pairs. Output is in [-pi, pi].
+    Use: converting network predictions back to actual joint angles.
+
+  extract_pose_features(T) -> list of 12 floats
+    Extracts [x, y, z, r11, r12, r13, ..., r33] from a 4x4 transform.
+    Use: building dataset rows — gives you the 12D pose vector from FK output.
+
+  angular_error(pred_rad, true_rad) -> ndarray
+    Computes the shortest angular difference between predicted and true
+    joint angles, handling the ±pi wraparound correctly.
+    Returns values in [-pi, pi]. Take abs() to get unsigned error.
+    Use: evaluating model accuracy. Always use this instead of simple
+    subtraction to avoid large errors at the ±pi boundary.
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.2  model.py  —  Baseline Residual MLP (v1)
+────────────────────────────────────────────────────────────────────────────────
+
+  class ResidualBlock(dim, dropout=0.0)
+    Pre-activation residual block: LayerNorm -> GELU -> Linear -> LayerNorm
+    -> GELU -> Dropout -> Linear, with an additive skip connection.
+    Use: internal building block for IKResidualMLP.
+
+  class IKResidualMLP(input_dim=12, output_dim=12, hidden_dim=256,
+                      num_blocks=4, dropout=0.0)
+    Residual MLP architecture for IK.
+    Architecture:
+      Linear(12 -> 256) -> GELU
+      -> 4 x ResidualBlock(256)
+      -> LayerNorm -> Linear(256 -> 128) -> GELU -> Linear(128 -> 12)
+    Input: 12D full pose [x, y, z, r11..r33]
+    Output: 12D sin/cos [sin(q1), cos(q1), ..., sin(q6), cos(q6)]
+    Use: the v1 baseline model. Used by train_ik_model.py, evaluate_model.py,
+    and infer_ik.py. NOT used by the final v3 pipeline.
+
+  build_model(input_dim, output_dim, hidden_dim, num_blocks, dropout) -> model
+    Convenience constructor: builds IKResidualMLP, prints param count.
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.3  train_ur5e_dnn.py  —  First DNN Trainer (earliest version)
+────────────────────────────────────────────────────────────────────────────────
+
+  set_seed(seed)
+    Sets numpy, torch, and CUDA seeds for reproducibility.
+
+  detect_columns(df) -> (input_cols, mode)
+    Auto-detects whether the CSV has position-only (3D) or full-pose (12D)
+    input. Returns the column list and mode string ("position" or "pose").
+    Use: lets the same training script handle different dataset formats.
+
+  load_and_prepare_data(csv_path) -> (X, Y, input_cols, mode)
+    Loads a CSV, calls detect_columns, drops NaNs, returns numpy arrays.
+
+  split_data(X, Y, seed) -> 6 arrays
+    80/10/10 train/val/test split using sklearn's train_test_split.
+
+  fit_scalers(X_train, Y_train) -> (input_scaler, output_scaler)
+    Fits StandardScalers on training data only.
+
+  transform_data(X, Y, input_scaler, output_scaler) -> scaled arrays
+    Applies the fitted scalers to X and Y.
+
+  class IKNet(input_dim, output_dim=6, hidden_sizes=(512,512,256,256))
+    Simple feedforward MLP: Linear -> ReLU -> ... -> Linear.
+    Predicts raw joint angles (not sin/cos). This was the earliest model.
+
+  build_model(input_dim, output_dim=6) -> IKNet
+    Constructs IKNet with default 4-layer architecture.
+
+  make_dataloader(X, Y, batch_size, shuffle) -> DataLoader
+    Wraps numpy arrays into a PyTorch DataLoader.
+
+  train_model(model, train_loader, val_loader, epochs, lr, patience, device)
+    Trains with Adam + MSE + early stopping on validation loss.
+    Returns history dict with train/val loss per epoch.
+
+  evaluate_model(model, test_loader, output_scaler, device) -> metrics
+    Evaluates on test set, un-scales predictions, reports per-joint MAE/RMSE.
+
+  save_artifacts(model, input_scaler, output_scaler, history, metrics, out_dir)
+    Saves model weights (.pt), scalers (.pkl), training history (.csv),
+    test metrics (.txt), and loss curve (.png).
+
+  main()
+    CLI entry point. Run:  python train_ur5e_dnn.py --csv data.csv --epochs 200
+    When to use: only if you want to retrain from scratch with the simplest
+    model (v1 feedforward MLP predicting raw angles).
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.4  train_ik_model.py  —  Residual MLP Trainer (v1 improved)
+────────────────────────────────────────────────────────────────────────────────
+
+  Uses the ResidualMLP from model.py with sin/cos encoding.
+  Improvements over train_ur5e_dnn.py:
+    - Sin/cos target encoding (no angle discontinuity)
+    - ReduceLROnPlateau scheduler
+    - Decoded angular MAE tracking during training
+    - Gradient-free early stopping
+
+  load_data(csv_path) -> (X, Y_raw)
+    Loads the full-pose dataset (12D input, 6D raw joints).
+
+  prepare_targets(Y_raw) -> Y_sincos
+    Encodes raw joints as sin/cos pairs (6 -> 12 dimensions).
+
+  fit_input_scaler(X_train) -> StandardScaler
+    Fits only an input scaler (targets are sin/cos, already in [-1,1]).
+
+  train_model(model, train_loader, val_loader, val_joints_raw,
+              epochs, lr, patience, device) -> history
+    Full training loop with:
+      - Adam optimizer
+      - MSE loss on sin/cos predictions
+      - ReduceLROnPlateau (halve LR after 5 epochs of no improvement)
+      - Early stopping with configurable patience
+      - Tracks decoded angular MAE each epoch
+
+  evaluate_model(model, test_loader, test_joints_raw, device)
+    Reports sin/cos MSE, decoded RMSE/MAE, and per-joint breakdown.
+
+  save_artifacts(model, input_scaler, history, metrics, out_dir)
+    Saves model, scaler, history CSV, metrics, and training plots.
+
+  plot_loss_and_lr(history, out_dir)
+    Creates loss curve, MAE curve, and LR schedule plots.
+
+  plot_pred_vs_true(preds, targets, out_dir)
+    Scatter plots of predicted vs true for all 6 joints.
+
+  main()
+    Run:  python train_ik_model.py --csv ur5e_pose_dataset.csv --epochs 150
+    When to use: for training the v1 residual MLP with sin/cos outputs.
+    Superseded by ik_v3/train.py for the best model.
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.5  generate_pose_dataset.py  —  Full-Pose Dataset Generator (v1)
+────────────────────────────────────────────────────────────────────────────────
+
+  generate_dataset(num_samples, output_csv, seed, joint_limits) -> stats
+    Generates a full-pose IK dataset. For each sample:
+      1. Randomly sample joint angles in [-pi, pi]
+      2. Run FK to get the 4x4 transform
+      3. Extract [x, y, z, r11..r33] (12D) + [q1..q6] (6D) = 18 columns
+    Writes to CSV in chunks of 50,000 to limit memory usage.
+    Use: generating training data for v1 models (train_ik_model.py).
+    Run:  python generate_pose_dataset.py --num_samples 500000
+
+  verify_fk(model)
+    Sanity checks: FK(zeros) == M, rotation matrices are orthonormal.
+    Runs automatically before dataset generation unless --skip_verify.
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.6  generate_ur5e_fk_ik_dataset.py  —  FK/IK Dataset Generator (earliest)
+────────────────────────────────────────────────────────────────────────────────
+
+  This was the first dataset generator. Contains its own copies of FK helpers
+  (skew, exp_rot, g_func, screw_exp, adjoint) and also includes a full
+  Newton-Raphson IK solver. Self-contained — doesn't import from utils.py.
+
+  matrix_log_so3(R) -> (w_hat, theta)
+    Computes the SO(3) matrix logarithm. Returns the skew-symmetric matrix
+    and rotation angle. Handles identity and pi-rotation edge cases.
+    Use: needed by inverse_kinematics() for the body-frame error twist.
+
+  matrix_log_se3(T) -> (4,4) ndarray
+    Computes the SE(3) matrix logarithm of a homogeneous transform.
+    Returns a 4x4 matrix in se(3). Used to compute the body twist error.
+
+  inverse_kinematics(T_desired, theta0, model, max_iter=60, eps_w=1e-5,
+                     eps_v=1e-4) -> theta
+    Newton-Raphson body-frame IK solver (direct port of MATLAB Lab2 code).
+    Uses the body Jacobian and matrix logarithm.
+    Step clamping: max 0.35 rad per joint per iteration.
+    Joint unwrapping to prevent large jumps.
+    Raises RuntimeError if convergence fails.
+    Use: standalone IK solver for testing/verification, NOT used in the
+    benchmark pipeline (benchmarks use their own solver implementations).
+
+  sample_joint_configuration(joint_limits, rng) -> (6,) ndarray
+    Samples random joints uniformly within limits.
+
+  extract_features(T, mode="position") -> list
+    Extracts position-only (3D) or full-pose (12D) features from a transform.
+
+  verify_fk(model)
+    FK sanity checks (same purpose as in generate_pose_dataset.py).
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.7  evaluate_model.py  —  Model Evaluation with FK Reconstruction
+────────────────────────────────────────────────────────────────────────────────
+
+  fk_error(q_pred, q_true) -> (pos_errors, rot_errors)
+    For each sample, runs FK on both predicted and true joints, then computes:
+      - Position error: Euclidean distance in mm
+      - Rotation error: angle of R_pred @ R_true^T (Frobenius-based), in deg
+    Use: the gold standard for evaluating IK accuracy. Joint-angle error alone
+    doesn't tell you how wrong the end-effector actually is.
+
+  main()
+    CLI tool to evaluate a trained model:
+      1. Loads model + scaler
+      2. Gets test split from the original CSV
+      3. Reports angular metrics (MAE, RMSE, per-joint)
+      4. Computes FK reconstruction error on a subset
+      5. Saves scatter plots and histograms
+    Run:  python evaluate_model.py --model pose_results/ik_pose_best.pt
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.8  infer_ik.py  —  Inference Interface (v1)
+────────────────────────────────────────────────────────────────────────────────
+
+  class IKInference(model_path, scaler_path, hidden_dim, num_blocks, dropout)
+    Wraps model loading + scaling + prediction into a clean API.
+    Methods:
+      predict(pose) -> (6,) joint angles
+        Single pose (12D) -> predicted joints. Handles scaling internally.
+      predict_batch(poses) -> (N, 6) joint angles
+        Batch prediction.
+      verify(q) -> (4,4) transform
+        Runs FK on predicted joints for verification.
+      predict_and_verify(pose) -> (q, T_reconstructed, pos_error)
+        Predict + FK verify in one call.
+    Use: quick inference for v1 models. NOT used with v3 models — use
+    ik_v3.infer.IKSolver instead.
+
+  interactive_mode(engine)
+    REPL loop: type 12 numbers, get predicted joints + FK verification.
+    Run:  python infer_ik.py  (starts interactive mode)
+    Or:   python infer_ik.py --pose 100 200 300 1 0 0 0 1 0 0 0 1
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.9  benchmark_ik.py  —  Production IK Benchmark (Adaptive LM)
+────────────────────────────────────────────────────────────────────────────────
+
+  Uses the v3 DNN model (IKSolver) + a production-quality IK solver.
+
+  spatial_jacobian(theta, model) -> (6,6) ndarray
+    Space-frame Jacobian via the adjoint method. Builds intermediate
+    transforms for each joint and applies Ad(T) to each screw axis.
+
+  body_jacobian(theta, model) -> (6,6) ndarray
+    Body-frame Jacobian using the body screw axes and accumulating
+    inverse transforms from right to left.
+
+  pose_error(T_target, T_current) -> (err_vec, pos_err, rot_err)
+    Computes body-frame error twist (6-vector), plus scalar position error
+    (mm) and rotation error (radians) for convergence checking.
+
+  ik_solve(T_target, q_init, model, max_iter=100, tol_pos=0.1,
+           tol_rot=0.01) -> (q, iters, pos_err, rot_err_deg, converged)
+    Production-grade IK: adaptive Levenberg-Marquardt with:
+      - Marquardt diagonal scaling: JtJ + lambda * diag(JtJ)
+      - Line search: tries alpha = 1.0, 0.5, 0.25
+      - Adaptive damping: decrease on success, increase on failure
+      - Joint clamping to [-pi, pi]
+    Tolerances: 0.1 mm position, 0.57° rotation.
+    Use: this is the fancier IK solver. Benchmark uses it to compare
+    DNN-init vs random-init.
+
+  BENCHMARK block (N=100):
+    For each test pose:
+      - DNN path: FK(random joints) -> DNN seed -> ik_solve
+      - Random path: best-of-5 random starts -> ik_solve
+    Reports convergence rate, iterations, speedup.
+    Run:  python benchmark_ik.py
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.10  benchmark_ik2.py  —  Newton-Raphson Benchmark (Primary)
+────────────────────────────────────────────────────────────────────────────────
+
+  This is the PRIMARY benchmark used in the writeup results.
+
+  mat_log3(R) -> (w_vec, angle)
+    SO(3) matrix logarithm. Returns angle-axis 3-vector and scalar angle.
+    Handles edge cases (identity, pi rotation with eigenvector fallback).
+
+  mat_log6(T) -> (twist, pos_err, rot_err)
+    SE(3) matrix logarithm. Returns 6-vector twist, position error, angle.
+
+  space_jacobian(theta, model) -> (6,6) ndarray
+    Space-frame Jacobian using iterative adjoint computation.
+    Identical in purpose to the one in benchmark_ik.py but slightly
+    different implementation.
+
+  ik_newton(T_target, q_init, model, max_iter=200,
+            eps_v=1.0, eps_w=0.01) -> (q, iters, pos_err, rot_err_deg, conv)
+    Newton-Raphson IK with:
+      - Spatial Jacobian (not body)
+      - Damped least squares: lambda proportional to error magnitude
+      - Step clamping: max 0.5 rad per iteration
+      - Joint clamping: clip to [-pi, pi]
+    Convergence: < 1 mm position AND < 0.57° rotation.
+    Max iterations: 200.
+    Use: the simpler, more textbook-style IK solver. Results are in the writeup.
+
+  BENCHMARK block (N=1000):
+    Same structure as benchmark_ik.py but with N=1000 test poses.
+    Run:  python benchmark_ik2.py
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.11  ik_v3/model.py  —  Seed-Conditioned IK Model (BEST MODEL)
+────────────────────────────────────────────────────────────────────────────────
+
+  class ResidualBlock(in_dim, out_dim)
+    Linear -> BatchNorm -> Mish, with additive residual if in_dim == out_dim.
+    Mish activation: x * tanh(softplus(x)) — smooth and non-monotonic.
+
+  class SeedConditionedIKModel()
+    THE BEST MODEL. Takes current joints as additional input (seed conditioning).
+    Input:  15D = 3D position + 6D rotation (continuous repr) + 6D seed joints
+    Output: 12D = sin/cos pairs for 6 predicted joints
+
+    Architecture:
+      Block 1: 15 -> 256 (no residual — dimension change)
+      Block 2: 256 -> 512 (no residual — dimension change)
+      Block 3: 512 -> 512 (residual skip: adds Block 2 output)
+      Block 4: 512 -> 256 (linear + BN + Mish) + skip from Block 1
+      Output:  256 -> 12 (no activation)
+
+    Key insight: the seed conditioning lets the network learn which IK branch
+    is closest to the current configuration, solving the multi-solution problem.
+    535,820 trainable parameters.
+
+  build_model() -> SeedConditionedIKModel
+    Constructs the model and prints architecture summary.
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.12  ik_v3/representations.py  —  Pose & Joint Representations
+────────────────────────────────────────────────────────────────────────────────
+
+  rotmat_to_6d(R) -> (..., 6) ndarray
+    Converts a 3x3 rotation matrix to the 6D continuous representation
+    (Zhou et al., 2019). Takes the first two columns of R and flattens them.
+    Avoids gimbal lock and discontinuities of Euler angles / quaternions.
+
+  r6d_to_rotmat(r6d) -> (N, 3, 3) torch.Tensor
+    Inverse: recovers a valid SO(3) rotation matrix from 6D representation
+    using Gram-Schmidt orthogonalization.
+
+  extract_pose_9d(T) -> (..., 9) ndarray
+    Extracts 9D pose from a 4x4 transform: [x, y, z, r6d_0..r6d_5].
+    Supports single (4,4) or batch (N,4,4) input.
+    Use: preparing model input from FK output.
+
+  encode_sincos(joints) -> (..., 12) ndarray
+    Same as utils.encode_sincos — interleaved sin/cos pairs.
+
+  decode_sincos(sincos) -> (..., 6) ndarray
+    Same as utils.decode_sincos — atan2 recovery.
+
+  decode_sincos_torch(sincos) -> (N, 6) torch.Tensor
+    PyTorch version (differentiable) for use during training/inference.
+
+  normalize_sincos(sincos) -> torch.Tensor
+    L2-normalizes each sin/cos pair so that sin^2 + cos^2 = 1.
+    Applied to model output before decoding. Prevents the network from
+    predicting impossible trigonometric values.
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.13  ik_v3/train.py  —  Training Script for Best Model
+────────────────────────────────────────────────────────────────────────────────
+
+  load_dataset(csv_path) -> (X_pose, X_seed, Y_raw)
+    Loads the seed-conditioned dataset:
+      X_pose (N, 9) = position + 6D rotation
+      X_seed (N, 6) = seed joint angles
+      Y_raw  (N, 6) = ground-truth joint angles
+
+  class NormalizedSinCosLoss
+    MSE loss that L2-normalizes predicted sin/cos pairs before computing
+    error. Ensures predictions lie on the unit circle.
+    L = MSE(normalize(pred), target)
+
+  angular_error(pred_rad, true_rad) -> ndarray
+    Wraparound-aware angular difference.
+
+  train(args)
+    Full training pipeline:
+      1. Loads data, splits 80/10/10
+      2. Fits separate StandardScalers for pose and seed
+      3. Concatenates to 15D input: [pose_scaled, seed_scaled]
+      4. Trains with Adam + NormalizedSinCosLoss
+      5. ReduceLROnPlateau (factor=0.5, patience=5)
+      6. Early stopping (patience=20)
+      7. Gradient clipping (max_norm=1.0)
+      8. Saves: model_best.pt, pose_scaler.pkl, seed_scaler.pkl,
+                training_history.csv, training_curves.png
+    Run:  python -m ik_v3.train --csv ur5e_seed_10m.csv --epochs 150
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.14  ik_v3/infer.py  —  Inference for Best Model
+────────────────────────────────────────────────────────────────────────────────
+
+  class IKSolver(model_dir, device="cpu")
+    THE PRIMARY INFERENCE CLASS. Loads the trained v3 model + scalers.
+
+    __init__(model_dir):
+      Loads model_best.pt, pose_scaler.pkl, seed_scaler.pkl from model_dir.
+      Typical usage:  solver = IKSolver("ik_v3/results")
+
+    solve(T_target, current_joints) -> (6,) ndarray
+      Main method. Given a target 4x4 transform and the robot's current
+      joint angles (seed), predicts the closest IK solution.
+      Steps: extract 9D pose -> scale pose & seed -> concat to 15D ->
+             forward pass -> normalize sin/cos -> decode to angles.
+      Use: the single-call IK prediction. Feed the result into a numerical
+      solver (Newton-Raphson) for refinement.
+
+    solve_batch(T_targets, current_joints) -> (N, 6) ndarray
+      Batch version. N target transforms + N seed configs -> N predictions.
+
+    verify(T_target, predicted_joints) -> dict
+      Runs FK on predicted joints and compares to target.
+      Returns: pos_error_mm, rot_error_deg, T_predicted.
+
+  demo(args)
+    CLI demo: generates random FK targets, solves IK, verifies.
+    Run:  python -m ik_v3.infer --model_dir ik_v3/results --num_samples 20
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.15  ik_v3/generate_dataset.py  —  Seed-Conditioned Dataset Generator
+────────────────────────────────────────────────────────────────────────────────
+
+  _skew_np(v) -> (3,3) ndarray
+    Internal helper for vectorised FK.
+
+  _fk_batch(joints, model) -> (N, 4, 4) ndarray
+    VECTORISED FK: processes all N samples at once by looping over 6 joints
+    instead of N samples. ~100x faster than per-sample FK.
+    Use: efficient batch FK for large dataset generation.
+
+  generate_seeds(joints, noise_std, limits) -> (N, 6) ndarray
+    Creates seed configurations by adding Gaussian noise (default sigma=0.5 rad)
+    to the ground-truth joints and clipping to joint limits.
+    This simulates the "current joint configuration" for seed conditioning.
+
+  generate_dataset(num_samples, seed_noise=0.5, batch_size=100000,
+                   joint_limits=None, rng_seed=42) -> DataFrame
+    Full pipeline:
+      1. Sample random joint configs
+      2. Batch FK -> 4x4 transforms
+      3. Extract 9D pose
+      4. Generate noisy seed joints
+      5. Stack into 21-column DataFrame: [pose_9d, seed_6d, joints_6d]
+    Run:  python -m ik_v3.generate_dataset --samples 1000000
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.16  ik_v2/model_global.py  —  Global IK Model (Experimental)
+────────────────────────────────────────────────────────────────────────────────
+
+  class GlobalIKModel(input_dim=7, output_dim=12, hidden_dim=512,
+                      num_blocks=6, dropout=0.0, norm="layer",
+                      num_regions=0, region_embed_dim=16)
+    Stronger residual MLP with SiLU activations and configurable norm.
+    Model A (num_regions=0): global baseline, pose features only.
+    Model B (num_regions>0): adds a learned region embedding — the network
+      receives a region ID and learns a 16D embedding for each workspace region.
+    Use: experimental. Part of the v2 architecture exploration. Not the
+    final model.
+
+  build_global_model(...) -> GlobalIKModel
+    Constructor with parameter count printout.
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.17  ik_v2/model_expert.py  —  Expert Ensemble (Experimental)
+────────────────────────────────────────────────────────────────────────────────
+
+  class ExpertIKModel(input_dim, output_dim, hidden_dim=256, num_blocks=4)
+    A single smaller expert MLP. Same architecture as GlobalIKModel but
+    narrower (256 vs 512 hidden dim) and fewer blocks.
+
+  class ExpertEnsemble(num_experts=8, **expert_kwargs)
+    Manages N independent expert models, one per workspace region.
+    At inference, each sample is routed to its region's expert.
+    forward(x, region_ids): routes each sample to the correct expert.
+    forward_expert(x, region_id): forwards through a single expert (for training).
+    Use: when you want region-specialized models. Each expert trains only on
+    data from its own workspace region.
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.18  ik_v2/model_moe.py  —  Mixture-of-Experts (Experimental)
+────────────────────────────────────────────────────────────────────────────────
+
+  class MoEExpert(input_dim=7, output_dim=12, hidden_dim=256, num_blocks=3)
+    Lightweight expert network for the MoE.
+
+  class GatingNetwork(input_dim=7, num_experts=8, hidden_dim=128)
+    Produces expert selection weights from the pose input.
+    2-layer MLP -> softmax logits over N experts.
+
+  class MixtureOfExperts(num_experts=8, ..., top_k=0)
+    Full MoE model. The gating network decides how much each expert
+    contributes to the final prediction.
+    top_k=0: soft routing (weighted sum of all experts)
+    top_k>0: hard routing (only top-k experts contribute)
+    get_gate_weights(x): returns softmaxed weights for analysis/visualization.
+    Use: experimental architecture exploration. The gating network learns
+    to specialize experts automatically.
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.19  ik_v2/model_refinement.py  —  Iterative Refinement (Experimental)
+────────────────────────────────────────────────────────────────────────────────
+
+  class InitialPredictor(input_dim=7, output_dim=12, hidden_dim=512)
+    Stage 1: pose -> initial sin/cos estimate.
+
+  class RefinementBlock(pose_dim=7, sincos_dim=12, hidden_dim=256)
+    Stage 2+: takes (pose, current_sincos) -> delta correction.
+    The correction is ADDED to the current estimate: q_new = q_old + delta.
+
+  class IterativeIKModel(pose_dim=7, ..., num_refine=2, share_refine=True)
+    Full iterative refinement: predict initial estimate, then refine 2-3 times.
+    share_refine=True: all refinement steps share the same weights (recurrent).
+    share_refine=False: each step has its own parameters.
+    forward(pose, return_intermediates=False): returns final prediction,
+      optionally with all intermediate estimates (for loss at each stage).
+    Use: mimics the structure of iterative IK solvers in a neural network.
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.20  ik_v2/regioning.py  —  Workspace Region Assignment
+────────────────────────────────────────────────────────────────────────────────
+
+  octant_label(x, y, z) -> int (0-7)
+    Maps a 3D position to one of 8 octants based on sign bits.
+
+  octant_labels_batch(positions) -> (N,) int array
+    Vectorised version: sign(x)*4 + sign(y)*2 + sign(z).
+
+  quadrant_labels_batch(positions) -> (N,) int array
+    4 regions based on sign of (x, y) only, ignoring z.
+
+  joint_bin_labels(joints, joint_idx=1, num_bins=4) -> (N,) int array
+    Bins a single joint angle into equal-width bins over [-pi, pi].
+    Useful for shoulder/elbow-based region splitting.
+
+  restricted_joint_limits(mode) -> list of (lo, hi)
+    Returns modified joint limits for specific branch restrictions:
+      'elbow_up': q3 in [-pi, 0]
+      'elbow_down': q3 in [0, pi]
+      'shoulder_left': q1 in [0, pi]
+      'shoulder_right': q1 in [-pi, 0]
+
+  class RegionAssigner(strategy, num_regions, joint_idx, custom_fn)
+    Unified interface for all region strategies.
+    assign(positions, joints) -> labels
+    Strategies: 'octant' (8 regions), 'quadrant' (4 regions),
+    'joint_bin' (configurable), 'custom' (user-supplied function).
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.21  ik_v2/pose_representation.py  —  Configurable Pose Representations
+────────────────────────────────────────────────────────────────────────────────
+
+  rotmat_to_quat(R) -> (4,) ndarray  [w, x, y, z]
+    Rotation matrix -> unit quaternion. Uses Shepperd's method for stability.
+    Canonicalizes to w >= 0 hemisphere.
+
+  rotmat_to_axisangle(R) -> (3,) ndarray
+    Rotation matrix -> axis-angle vector (omega * theta).
+    Compact (3D) but has singularity at theta=0 and theta=pi.
+
+  quat_to_rotmat(q) -> (3,3) ndarray
+    Quaternion -> rotation matrix.
+
+  extract_pose(T, mode="quat") -> ndarray
+    Extracts pose from 4x4 transform in the chosen representation:
+      'rotmat'   -> 12D: [x,y,z, r11..r33]
+      'quat'     -> 7D:  [x,y,z, qw,qx,qy,qz]
+      'axisangle'-> 6D:  [x,y,z, ax1,ax2,ax3]
+
+  pose_dim(mode) -> int
+    Returns dimensionality: rotmat=12, quat=7, axisangle=6.
+
+  pose_columns(mode) -> list[str]
+    Column names for each representation.
+
+  quat_to_rotmat_torch(q) -> (N,3,3) torch.Tensor
+    Batch quaternion -> rotation matrix in PyTorch (differentiable).
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.22  ik_v2/fk_loss.py  —  Differentiable FK Consistency Loss
+────────────────────────────────────────────────────────────────────────────────
+
+  _skew_batch(v) -> (N,3,3) torch.Tensor
+    Batched skew-symmetric matrix construction.
+
+  _screw_exp_batch(w, v, theta) -> (N,4,4) torch.Tensor
+    Batched screw exponential. Broadcasts a single screw axis (w,v) across
+    N samples with different joint angles theta.
+
+  forward_kinematics_batch(joints) -> (N,4,4) torch.Tensor
+    Full differentiable FK chain in PyTorch. Product of Exponentials with
+    pre-loaded UR5e screw axes. Gradients flow through the entire FK chain.
+    Use: computing FK loss during training — penalizes predictions whose
+    FK output doesn't match the target pose.
+
+  decode_sincos_torch(sincos) -> (N,6) torch.Tensor
+    Differentiable atan2 decoding.
+
+  class FKConsistencyLoss(lambda_joint=1.0, lambda_pos=0.01, lambda_rot=0.1)
+    Combined loss:
+      L = lambda_joint * MSE(pred_sincos, true_sincos)
+        + lambda_pos   * MSE(FK_pos / 100, target_pos / 100)
+        + lambda_rot   * MSE(FK_R, target_R)
+    The FK term ensures predictions are physically consistent — even if
+    sin/cos values are slightly off, the FK pose should match.
+    Supports rotmat, quaternion, and position-only target formats.
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.23  Quick-Reference: Which Files to Use
+────────────────────────────────────────────────────────────────────────────────
+
+  TASK                          FILE(S) TO USE
+  ─────────────────────────     ─────────────────────────────────────────
+  Generate training data        ik_v3/generate_dataset.py
+  Train the best model          ik_v3/train.py  (with ik_v3/model.py)
+  Run IK inference              ik_v3/infer.py  (IKSolver class)
+  Benchmark DNN vs random       benchmark_ik2.py  (primary)
+  Evaluate a model              evaluate_model.py
+  Understand FK/kinematics      utils.py
+  Explore experimental models   ik_v2/  (not used in final results)
+
+
 ================================================================================
                               END OF REPORT (v1)
 ================================================================================

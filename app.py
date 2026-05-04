@@ -24,6 +24,26 @@ import numpy as np
 from ik_v3.infer import IKSolver
 from utils import build_ur5e_model, forward_kinematics, skew
 
+try:
+    import rospy
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+    ROS_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover - depends on ROS runtime
+    rospy = None
+    JointTrajectory = None
+    JointTrajectoryPoint = None
+    ROS_IMPORT_ERROR = exc
+
+
+UR5E_JOINT_NAMES = [
+    "shoulder_pan_joint",
+    "shoulder_lift_joint",
+    "elbow_joint",
+    "wrist_1_joint",
+    "wrist_2_joint",
+    "wrist_3_joint",
+]
+
 
 @dataclass
 class WaypointResult:
@@ -35,6 +55,33 @@ class WaypointResult:
     rot_err_ref_deg: float
     iters_ref: int
     converged_ref: bool
+
+
+def make_robot_publisher(topic: str = "/scaled_pos_joint_traj_controller/command"):
+    """Create ROS publisher for UR5e joint trajectory commands."""
+    if rospy is None:
+        raise RuntimeError(f"ROS is not available in this environment: {ROS_IMPORT_ERROR}")
+
+    if not rospy.core.is_initialized():
+        rospy.init_node("ik_robot_sender", anonymous=False)
+
+    pub = rospy.Publisher(topic, JointTrajectory, queue_size=10)
+    rospy.sleep(0.5)
+    return pub
+
+
+def send_joint_position(pub, q: np.ndarray, duration: float = 5.0) -> None:
+    """Publish one UR5e joint trajectory waypoint."""
+    msg = JointTrajectory()
+    msg.joint_names = list(UR5E_JOINT_NAMES)
+
+    point = JointTrajectoryPoint()
+    point.positions = [float(x) for x in np.asarray(q).flatten().tolist()]
+    point.velocities = [0.0] * 6
+    point.time_from_start = rospy.Duration(duration)
+
+    msg.points.append(point)
+    pub.publish(msg)
 
 
 def space_jacobian(theta: np.ndarray, model: dict) -> np.ndarray:
@@ -148,7 +195,14 @@ def build_square_targets(center_t: np.ndarray, side_mm: float, steps_per_edge: i
     return targets
 
 
-def run_demo(model_dir: str, side_mm: float, steps_per_edge: int, seed: int) -> int:
+def run_demo(
+    model_dir: str,
+    side_mm: float,
+    steps_per_edge: int,
+    seed: int,
+    send_to_robot: bool = False,
+    move_duration: float = 5.0,
+) -> int:
     np.random.seed(seed)
     ur5e = build_ur5e_model()
     solver = IKSolver(model_dir=model_dir, device="cpu")
@@ -168,6 +222,11 @@ def run_demo(model_dir: str, side_mm: float, steps_per_edge: int, seed: int) -> 
     print("  WITH IK     = DNN output + Newton refinement")
     print("  Convergence tolerance: position < 1.0 mm AND rotation < 0.57 deg")
 
+    pub = None
+    if send_to_robot:
+        print("WARNING: Sending IK waypoints to the real robot. Make sure the workspace is clear.")
+        pub = make_robot_publisher(topic="/scaled_pos_joint_traj_controller/command")
+
     q_seed = q_center.copy()
     results: list[WaypointResult] = []
     start = time.time()
@@ -185,6 +244,15 @@ def run_demo(model_dir: str, side_mm: float, steps_per_edge: int, seed: int) -> 
             eps_v_mm=1.0,
             eps_w_rad=0.01,
         )
+
+        if send_to_robot:
+            if ok_ref:
+                q_print = [float(v) for v in np.asarray(q_ref).flatten().tolist()]
+                print(f"[robot] waypoint {i:02d}: publishing q_ref = {q_print}")
+                send_joint_position(pub, q_ref, duration=move_duration)
+                rospy.sleep(move_duration + 0.5)
+            else:
+                print(f"[robot] waypoint {i:02d}: refinement failed, skipping publish")
 
         results.append(
             WaypointResult(
@@ -249,6 +317,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--side_mm", type=float, default=60.0, help="Square side length in mm")
     parser.add_argument("--steps_per_edge", type=int, default=10, help="Waypoints per edge")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--send_to_robot",
+        action="store_true",
+        help="Publish refined IK waypoints to /scaled_pos_joint_traj_controller/command",
+    )
+    parser.add_argument(
+        "--move_duration",
+        type=float,
+        default=5.0,
+        help="Trajectory point time_from_start in seconds when sending to robot",
+    )
     return parser.parse_args()
 
 
@@ -256,6 +335,9 @@ def main() -> int:
     args = parse_args()
     if not os.path.isdir(args.model_dir):
         print(f"ERROR: model directory not found: {args.model_dir}")
+        return 2
+    if args.send_to_robot and rospy is None:
+        print(f"ERROR: --send_to_robot was requested but ROS imports are unavailable: {ROS_IMPORT_ERROR}")
         return 2
     required = ["model_best.pt", "pose_scaler.pkl", "seed_scaler.pkl"]
     missing = [name for name in required if not os.path.exists(os.path.join(args.model_dir, name))]
@@ -267,6 +349,8 @@ def main() -> int:
         side_mm=args.side_mm,
         steps_per_edge=args.steps_per_edge,
         seed=args.seed,
+        send_to_robot=args.send_to_robot,
+        move_duration=args.move_duration,
     )
 
 

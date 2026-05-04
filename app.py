@@ -44,6 +44,8 @@ UR5E_JOINT_NAMES = [
     "wrist_3_joint",
 ]
 
+SAFE_HOME_JOINTS = np.array([0.0, -1.57, 1.57, -1.57, -1.57, 0.0], dtype=np.float32)
+
 
 @dataclass
 class WaypointResult:
@@ -195,11 +197,44 @@ def build_square_targets(center_t: np.ndarray, side_mm: float, steps_per_edge: i
     return targets
 
 
+def build_multi_location_targets(
+    base_t: np.ndarray,
+    side_mm: float,
+    steps_per_edge: int,
+    location_step_mm: float,
+    num_locations: int,
+) -> list[np.ndarray]:
+    """Create small squares at multiple nearby XY locations, fixed orientation and Z."""
+    c = base_t[:3, 3].copy()
+    r = base_t[:3, :3].copy()
+
+    # Center + nearby offsets to keep motion gentle.
+    all_offsets = [
+        np.array([0.0, 0.0, 0.0]),
+        np.array([location_step_mm, 0.0, 0.0]),
+        np.array([0.0, location_step_mm, 0.0]),
+        np.array([-location_step_mm, 0.0, 0.0]),
+        np.array([0.0, -location_step_mm, 0.0]),
+    ]
+    selected = all_offsets[: max(1, min(num_locations, len(all_offsets)))]
+
+    targets: list[np.ndarray] = []
+    for off in selected:
+        t_center = np.eye(4)
+        t_center[:3, :3] = r
+        t_center[:3, 3] = c + off
+        targets.extend(build_square_targets(t_center, side_mm=side_mm, steps_per_edge=steps_per_edge))
+    return targets
+
+
 def run_demo(
     model_dir: str,
     side_mm: float,
     steps_per_edge: int,
     seed: int,
+    safe_z_min_mm: float = 120.0,
+    location_step_mm: float = 40.0,
+    num_locations: int = 3,
     send_to_robot: bool = False,
     move_duration: float = 5.0,
 ) -> int:
@@ -207,16 +242,27 @@ def run_demo(
     ur5e = build_ur5e_model()
     solver = IKSolver(model_dir=model_dir, device="cpu")
 
-    # Pick a random reachable center from FK of a random valid configuration.
-    q_center = np.random.uniform(-np.pi, np.pi, size=6).astype(np.float32)
+    # Use a conservative home-like seed and clamp Z upward for safer motion.
+    q_center = SAFE_HOME_JOINTS.copy()
     t_center = forward_kinematics(q_center, ur5e)
+    t_center[:3, 3][2] = max(float(t_center[:3, 3][2]), float(safe_z_min_mm))
 
-    targets = build_square_targets(t_center, side_mm=side_mm, steps_per_edge=steps_per_edge)
+    targets = build_multi_location_targets(
+        t_center,
+        side_mm=side_mm,
+        steps_per_edge=steps_per_edge,
+        location_step_mm=location_step_mm,
+        num_locations=num_locations,
+    )
 
     print("\n=== ES259 One-Command IK Demo ===")
     print(f"Model dir: {model_dir}")
     print(f"Random seed: {seed}")
-    print(f"Square side: {side_mm:.1f} mm | Steps/edge: {steps_per_edge} | Waypoints: {len(targets)}")
+    print(
+        f"Square side: {side_mm:.1f} mm | Steps/edge: {steps_per_edge} | "
+        f"Locations: {num_locations} | Waypoints: {len(targets)}"
+    )
+    print(f"Safety Z floor: {safe_z_min_mm:.1f} mm | Location spacing: {location_step_mm:.1f} mm")
     print("Comparison:")
     print("  WITHOUT IK  = DNN-only output")
     print("  WITH IK     = DNN output + Newton refinement")
@@ -314,9 +360,12 @@ def parse_args() -> argparse.Namespace:
         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ik_v3", "results"),
         help="Path containing model_best.pt, pose_scaler.pkl, seed_scaler.pkl",
     )
-    parser.add_argument("--side_mm", type=float, default=60.0, help="Square side length in mm")
-    parser.add_argument("--steps_per_edge", type=int, default=10, help="Waypoints per edge")
+    parser.add_argument("--side_mm", type=float, default=20.0, help="Square side length in mm")
+    parser.add_argument("--steps_per_edge", type=int, default=6, help="Waypoints per edge")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--safe_z_min_mm", type=float, default=120.0, help="Minimum tool Z (mm) for target generation")
+    parser.add_argument("--location_step_mm", type=float, default=40.0, help="XY spacing (mm) between square centers")
+    parser.add_argument("--num_locations", type=int, default=3, help="Number of nearby square locations (1-5)")
     parser.add_argument(
         "--send_to_robot",
         action="store_true",
@@ -349,6 +398,9 @@ def main() -> int:
         side_mm=args.side_mm,
         steps_per_edge=args.steps_per_edge,
         seed=args.seed,
+        safe_z_min_mm=args.safe_z_min_mm,
+        location_step_mm=args.location_step_mm,
+        num_locations=args.num_locations,
         send_to_robot=args.send_to_robot,
         move_duration=args.move_duration,
     )

@@ -30,6 +30,7 @@ class WaypointResult:
     idx: int
     pos_err_dnn_mm: float
     rot_err_dnn_deg: float
+    converged_dnn: bool
     pos_err_ref_mm: float
     rot_err_ref_deg: float
     iters_ref: int
@@ -162,6 +163,10 @@ def run_demo(model_dir: str, side_mm: float, steps_per_edge: int, seed: int) -> 
     print(f"Model dir: {model_dir}")
     print(f"Random seed: {seed}")
     print(f"Square side: {side_mm:.1f} mm | Steps/edge: {steps_per_edge} | Waypoints: {len(targets)}")
+    print("Comparison:")
+    print("  WITHOUT IK  = DNN-only output")
+    print("  WITH IK     = DNN output + Newton refinement")
+    print("  Convergence tolerance: position < 1.0 mm AND rotation < 0.57 deg")
 
     q_seed = q_center.copy()
     results: list[WaypointResult] = []
@@ -170,6 +175,7 @@ def run_demo(model_dir: str, side_mm: float, steps_per_edge: int, seed: int) -> 
     for i, t_target in enumerate(targets, start=1):
         q_dnn = solver.solve(t_target, q_seed)
         dnn_check = solver.verify(t_target, q_dnn)
+        dnn_ok = (dnn_check["pos_error_mm"] < 1.0) and (dnn_check["rot_error_deg"] < np.degrees(0.01))
 
         q_ref, it_ref, pe_ref, re_ref, ok_ref = ik_newton_refine(
             t_target,
@@ -185,6 +191,7 @@ def run_demo(model_dir: str, side_mm: float, steps_per_edge: int, seed: int) -> 
                 idx=i,
                 pos_err_dnn_mm=float(dnn_check["pos_error_mm"]),
                 rot_err_dnn_deg=float(dnn_check["rot_error_deg"]),
+                converged_dnn=bool(dnn_ok),
                 pos_err_ref_mm=float(pe_ref),
                 rot_err_ref_deg=float(re_ref),
                 iters_ref=int(it_ref),
@@ -198,6 +205,7 @@ def run_demo(model_dir: str, side_mm: float, steps_per_edge: int, seed: int) -> 
 
     pos_dnn = np.array([r.pos_err_dnn_mm for r in results], dtype=float)
     rot_dnn = np.array([r.rot_err_dnn_deg for r in results], dtype=float)
+    conv_dnn = np.array([r.converged_dnn for r in results], dtype=bool)
     pos_ref = np.array([r.pos_err_ref_mm for r in results], dtype=float)
     rot_ref = np.array([r.rot_err_ref_deg for r in results], dtype=float)
     its_ref = np.array([r.iters_ref for r in results], dtype=float)
@@ -205,18 +213,22 @@ def run_demo(model_dir: str, side_mm: float, steps_per_edge: int, seed: int) -> 
 
     print("\nPer-waypoint (first 10):")
     for r in results[:10]:
-        flag = "OK" if r.converged_ref else "FAIL"
+        dnn_flag = "OK" if r.converged_dnn else "FAIL"
+        ref_flag = "OK" if r.converged_ref else "FAIL"
         print(
             f"  wp {r.idx:02d} | DNN: pos={r.pos_err_dnn_mm:7.2f} mm rot={r.rot_err_dnn_deg:6.2f} deg"
-            f" | IK refine: pos={r.pos_err_ref_mm:7.3f} mm rot={r.rot_err_ref_deg:6.3f} deg"
-            f" iters={r.iters_ref:3d} {flag}"
+            f" {dnn_flag} | IK refine: pos={r.pos_err_ref_mm:7.3f} mm rot={r.rot_err_ref_deg:6.3f} deg"
+            f" iters={r.iters_ref:3d} {ref_flag}"
         )
 
     print("\nSummary:")
-    print(f"  DNN-only  mean pos err: {np.mean(pos_dnn):.2f} mm | mean rot err: {np.mean(rot_dnn):.2f} deg")
-    print(f"  IK-refined mean pos err: {np.mean(pos_ref):.3f} mm | mean rot err: {np.mean(rot_ref):.3f} deg")
-    print(f"  IK-refined convergence: {np.sum(conv_ref)}/{len(conv_ref)} ({100.0*np.mean(conv_ref):.1f}%)")
-    print(f"  IK-refined mean iterations: {np.mean(its_ref):.1f}")
+    print("  WITHOUT IK (DNN-only):")
+    print(f"    Mean pos err: {np.mean(pos_dnn):.2f} mm | Mean rot err: {np.mean(rot_dnn):.2f} deg")
+    print(f"    Convergence:  {np.sum(conv_dnn)}/{len(conv_dnn)} ({100.0*np.mean(conv_dnn):.1f}%)")
+    print("  WITH IK (DNN + Newton refinement):")
+    print(f"    Mean pos err: {np.mean(pos_ref):.3f} mm | Mean rot err: {np.mean(rot_ref):.3f} deg")
+    print(f"    Convergence:  {np.sum(conv_ref)}/{len(conv_ref)} ({100.0*np.mean(conv_ref):.1f}%)")
+    print(f"    Mean iterations (Newton): {np.mean(its_ref):.1f}")
     print(f"  Elapsed: {elapsed:.2f}s")
 
     if np.all(conv_ref):

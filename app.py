@@ -57,6 +57,10 @@ class WaypointResult:
     rot_err_ref_deg: float
     iters_ref: int
     converged_ref: bool
+    pos_err_ctrl_mm: float
+    rot_err_ctrl_deg: float
+    iters_ctrl: int
+    converged_ctrl: bool
 
 
 def make_robot_publisher(topic: str = "/scaled_pos_joint_traj_controller/command"):
@@ -266,6 +270,7 @@ def run_demo(
     print("Comparison:")
     print("  WITHOUT IK  = DNN-only output")
     print("  WITH IK     = DNN output + Newton refinement")
+    print("  CONTROL     = Pure Newton IK (no DNN warm-start)")
     print("  Convergence tolerance: position < 1.0 mm AND rotation < 0.57 deg")
 
     pub = None
@@ -274,6 +279,7 @@ def run_demo(
         pub = make_robot_publisher(topic="/scaled_pos_joint_traj_controller/command")
 
     q_seed = q_center.copy()
+    q_seed_ctrl = q_center.copy()
     results: list[WaypointResult] = []
     start = time.time()
 
@@ -285,6 +291,16 @@ def run_demo(
         q_ref, it_ref, pe_ref, re_ref, ok_ref = ik_newton_refine(
             t_target,
             q_dnn,
+            ur5e,
+            max_iter=200,
+            eps_v_mm=1.0,
+            eps_w_rad=0.01,
+        )
+
+        # Control baseline: pure IK solve without DNN warm-start.
+        q_ctrl, it_ctrl, pe_ctrl, re_ctrl, ok_ctrl = ik_newton_refine(
+            t_target,
+            q_seed_ctrl,
             ur5e,
             max_iter=200,
             eps_v_mm=1.0,
@@ -310,10 +326,15 @@ def run_demo(
                 rot_err_ref_deg=float(re_ref),
                 iters_ref=int(it_ref),
                 converged_ref=bool(ok_ref),
+                pos_err_ctrl_mm=float(pe_ctrl),
+                rot_err_ctrl_deg=float(re_ctrl),
+                iters_ctrl=int(it_ctrl),
+                converged_ctrl=bool(ok_ctrl),
             )
         )
 
         q_seed = q_ref
+        q_seed_ctrl = q_ctrl
 
     elapsed = time.time() - start
 
@@ -324,15 +345,21 @@ def run_demo(
     rot_ref = np.array([r.rot_err_ref_deg for r in results], dtype=float)
     its_ref = np.array([r.iters_ref for r in results], dtype=float)
     conv_ref = np.array([r.converged_ref for r in results], dtype=bool)
+    pos_ctrl = np.array([r.pos_err_ctrl_mm for r in results], dtype=float)
+    rot_ctrl = np.array([r.rot_err_ctrl_deg for r in results], dtype=float)
+    its_ctrl = np.array([r.iters_ctrl for r in results], dtype=float)
+    conv_ctrl = np.array([r.converged_ctrl for r in results], dtype=bool)
 
     print("\nPer-waypoint (first 10):")
     for r in results[:10]:
         dnn_flag = "OK" if r.converged_dnn else "FAIL"
         ref_flag = "OK" if r.converged_ref else "FAIL"
+        ctrl_flag = "OK" if r.converged_ctrl else "FAIL"
         print(
             f"  wp {r.idx:02d} | DNN: pos={r.pos_err_dnn_mm:7.2f} mm rot={r.rot_err_dnn_deg:6.2f} deg"
             f" {dnn_flag} | IK refine: pos={r.pos_err_ref_mm:7.3f} mm rot={r.rot_err_ref_deg:6.3f} deg"
-            f" iters={r.iters_ref:3d} {ref_flag}"
+            f" iters={r.iters_ref:3d} {ref_flag} | CONTROL: pos={r.pos_err_ctrl_mm:7.3f} mm"
+            f" rot={r.rot_err_ctrl_deg:6.3f} deg iters={r.iters_ctrl:3d} {ctrl_flag}"
         )
 
     print("\nSummary:")
@@ -343,12 +370,16 @@ def run_demo(
     print(f"    Mean pos err: {np.mean(pos_ref):.3f} mm | Mean rot err: {np.mean(rot_ref):.3f} deg")
     print(f"    Convergence:  {np.sum(conv_ref)}/{len(conv_ref)} ({100.0*np.mean(conv_ref):.1f}%)")
     print(f"    Mean iterations (Newton): {np.mean(its_ref):.1f}")
+    print("  CONTROL (Pure Newton IK):")
+    print(f"    Mean pos err: {np.mean(pos_ctrl):.3f} mm | Mean rot err: {np.mean(rot_ctrl):.3f} deg")
+    print(f"    Convergence:  {np.sum(conv_ctrl)}/{len(conv_ctrl)} ({100.0*np.mean(conv_ctrl):.1f}%)")
+    print(f"    Mean iterations (Newton): {np.mean(its_ctrl):.1f}")
     print(f"  Elapsed: {elapsed:.2f}s")
 
-    if np.all(conv_ref):
-        print("\nPASS: Square trajectory verified with both DNN IK and Newton IK refinement.")
+    if np.all(conv_ref) and np.all(conv_ctrl):
+        print("\nPASS: Trajectory verified for WITHOUT IK, WITH IK, and CONTROL (pure IK).")
         return 0
-    print("\nWARN: Some waypoints did not meet IK refinement tolerance.")
+    print("\nWARN: Some waypoints did not meet tolerance in WITH IK or CONTROL track.")
     return 1
 
 

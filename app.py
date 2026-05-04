@@ -201,12 +201,56 @@ def build_square_targets(center_t: np.ndarray, side_mm: float, steps_per_edge: i
     return targets
 
 
+def build_region_activity_targets(
+    center_t: np.ndarray,
+    side_mm: float,
+    steps_per_edge: int,
+    region_loops: int,
+) -> list[np.ndarray]:
+    """Create repeated small motions inside one region.
+
+    Pattern per loop:
+    - one small square
+    - a few cross/diagonal nudges around the same center
+    This keeps the robot moving locally for longer instead of leaving the region
+    after a single short pass.
+    """
+    base_targets = build_square_targets(center_t, side_mm=side_mm, steps_per_edge=steps_per_edge)
+    center = center_t[:3, 3].copy()
+    rotation = center_t[:3, :3].copy()
+    micro = max(4.0, side_mm * 0.35)
+
+    local_offsets = [
+        np.array([0.0, 0.0, 0.0]),
+        np.array([micro, 0.0, 0.0]),
+        np.array([0.0, micro, 0.0]),
+        np.array([-micro, 0.0, 0.0]),
+        np.array([0.0, -micro, 0.0]),
+        np.array([micro, micro, 0.0]),
+        np.array([-micro, micro, 0.0]),
+        np.array([-micro, -micro, 0.0]),
+        np.array([micro, -micro, 0.0]),
+        np.array([0.0, 0.0, 0.0]),
+    ]
+
+    targets: list[np.ndarray] = []
+    for _ in range(max(1, region_loops)):
+        targets.extend(base_targets)
+        for off in local_offsets:
+            t = np.eye(4)
+            t[:3, :3] = rotation
+            t[:3, 3] = center + off
+            targets.append(t)
+    return targets
+
+
 def build_multi_location_targets(
     base_t: np.ndarray,
     side_mm: float,
     steps_per_edge: int,
     location_step_mm: float,
     num_locations: int,
+    region_loops: int,
 ) -> list[np.ndarray]:
     """Create small squares at multiple nearby XY locations, fixed orientation and Z."""
     c = base_t[:3, 3].copy()
@@ -227,7 +271,14 @@ def build_multi_location_targets(
         t_center = np.eye(4)
         t_center[:3, :3] = r
         t_center[:3, 3] = c + off
-        targets.extend(build_square_targets(t_center, side_mm=side_mm, steps_per_edge=steps_per_edge))
+        targets.extend(
+            build_region_activity_targets(
+                t_center,
+                side_mm=side_mm,
+                steps_per_edge=steps_per_edge,
+                region_loops=region_loops,
+            )
+        )
     return targets
 
 
@@ -239,6 +290,7 @@ def run_demo(
     safe_z_min_mm: float = 120.0,
     location_step_mm: float = 40.0,
     num_locations: int = 3,
+    region_loops: int = 3,
     send_to_robot: bool = False,
     move_duration: float = 5.0,
 ) -> int:
@@ -257,6 +309,7 @@ def run_demo(
         steps_per_edge=steps_per_edge,
         location_step_mm=location_step_mm,
         num_locations=num_locations,
+        region_loops=region_loops,
     )
 
     print("\n=== ES259 One-Command IK Demo ===")
@@ -266,7 +319,10 @@ def run_demo(
         f"Square side: {side_mm:.1f} mm | Steps/edge: {steps_per_edge} | "
         f"Locations: {num_locations} | Waypoints: {len(targets)}"
     )
-    print(f"Safety Z floor: {safe_z_min_mm:.1f} mm | Location spacing: {location_step_mm:.1f} mm")
+    print(
+        f"Safety Z floor: {safe_z_min_mm:.1f} mm | Location spacing: {location_step_mm:.1f} mm | "
+        f"Region loops: {region_loops}"
+    )
     print("Comparison:")
     print("  WITHOUT IK  = DNN-only output")
     print("  WITH IK     = DNN output + Newton refinement")
@@ -398,6 +454,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--location_step_mm", type=float, default=40.0, help="XY spacing (mm) between square centers")
     parser.add_argument("--num_locations", type=int, default=3, help="Number of nearby square locations (1-5)")
     parser.add_argument(
+        "--region_loops",
+        type=int,
+        default=3,
+        help="How many repeated local motion loops to perform inside each region",
+    )
+    parser.add_argument(
         "--send_to_robot",
         action="store_true",
         help="Publish refined IK waypoints to /scaled_pos_joint_traj_controller/command",
@@ -432,6 +494,7 @@ def main() -> int:
         safe_z_min_mm=args.safe_z_min_mm,
         location_step_mm=args.location_step_mm,
         num_locations=args.num_locations,
+        region_loops=args.region_loops,
         send_to_robot=args.send_to_robot,
         move_duration=args.move_duration,
     )

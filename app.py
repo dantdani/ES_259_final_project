@@ -16,10 +16,21 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import time
 from dataclasses import dataclass
 
 import numpy as np
+
+# NumPy pickle compatibility shim for environments where pickles reference
+# numpy._core instead of numpy.core.
+try:
+    import numpy._core as _np_core
+except Exception:  # pragma: no cover - compatibility fallback
+    import numpy.core as _np_core
+
+sys.modules.setdefault("numpy._core", _np_core)
+sys.modules.setdefault("numpy._core.multiarray", _np_core.multiarray)
 
 from ik_v3.infer import IKSolver
 from utils import build_ur5e_model, forward_kinematics, skew
@@ -87,6 +98,23 @@ def send_joint_position(pub, q: np.ndarray, duration: float = 5.0) -> None:
     point.time_from_start = rospy.Duration(duration)
 
     msg.points.append(point)
+    pub.publish(msg)
+
+
+def send_joint_trajectory(pub, q_list: list[np.ndarray], total_duration: float) -> None:
+    """Publish an entire joint trajectory in one message for smooth motion."""
+    msg = JointTrajectory()
+    msg.joint_names = list(UR5E_JOINT_NAMES)
+
+    n_points = len(q_list)
+    for idx, q in enumerate(q_list):
+        point = JointTrajectoryPoint()
+        point.positions = [float(x) for x in np.asarray(q).flatten().tolist()]
+        point.velocities = [0.0] * 6
+        t_i = total_duration * (idx + 1) / n_points
+        point.time_from_start = rospy.Duration(t_i)
+        msg.points.append(point)
+
     pub.publish(msg)
 
 
@@ -201,6 +229,24 @@ def build_square_targets(center_t: np.ndarray, side_mm: float, steps_per_edge: i
     return targets
 
 
+def build_circle_targets(center_t: np.ndarray, radius_mm: float, num_points: int) -> list[np.ndarray]:
+    """Create closed circle targets in XY with fixed orientation and Z."""
+    center = center_t[:3, 3].copy()
+    rotation = center_t[:3, :3].copy()
+
+    targets: list[np.ndarray] = []
+    for k in range(num_points + 1):
+        angle = 2.0 * np.pi * k / num_points
+        x = center[0] + radius_mm * np.cos(angle)
+        y = center[1] + radius_mm * np.sin(angle)
+        z = center[2]
+        t = np.eye(4)
+        t[:3, :3] = rotation
+        t[:3, 3] = np.array([x, y, z])
+        targets.append(t)
+    return targets
+
+
 def build_region_activity_targets(
     center_t: np.ndarray,
     side_mm: float,
@@ -284,13 +330,18 @@ def build_multi_location_targets(
 
 def run_demo(
     model_dir: str,
+    trajectory: str,
     side_mm: float,
     steps_per_edge: int,
+    circle_radius_mm: float,
+    circle_duration: float,
+    circle_points: int,
     seed: int,
     safe_z_min_mm: float = 120.0,
     location_step_mm: float = 40.0,
     num_locations: int = 3,
     region_loops: int = 3,
+    allow_large_motion: bool = False,
     send_to_robot: bool = False,
     move_duration: float = 5.0,
 ) -> int:
@@ -303,26 +354,37 @@ def run_demo(
     t_center = forward_kinematics(q_center, ur5e)
     t_center[:3, 3][2] = max(float(t_center[:3, 3][2]), float(safe_z_min_mm))
 
-    targets = build_multi_location_targets(
-        t_center,
-        side_mm=side_mm,
-        steps_per_edge=steps_per_edge,
-        location_step_mm=location_step_mm,
-        num_locations=num_locations,
-        region_loops=region_loops,
-    )
+    if trajectory == "circle":
+        targets = build_circle_targets(t_center, radius_mm=circle_radius_mm, num_points=circle_points)
+    else:
+        targets = build_multi_location_targets(
+            t_center,
+            side_mm=side_mm,
+            steps_per_edge=steps_per_edge,
+            location_step_mm=location_step_mm,
+            num_locations=num_locations,
+            region_loops=region_loops,
+        )
 
     print("\n=== ES259 One-Command IK Demo ===")
     print(f"Model dir: {model_dir}")
     print(f"Random seed: {seed}")
-    print(
-        f"Square side: {side_mm:.1f} mm | Steps/edge: {steps_per_edge} | "
-        f"Locations: {num_locations} | Waypoints: {len(targets)}"
-    )
-    print(
-        f"Safety Z floor: {safe_z_min_mm:.1f} mm | Location spacing: {location_step_mm:.1f} mm | "
-        f"Region loops: {region_loops}"
-    )
+    print(f"Trajectory mode: {trajectory}")
+    if trajectory == "circle":
+        print(
+            f"Circle radius: {circle_radius_mm:.1f} mm | Circle points: {circle_points} | "
+            f"Circle duration: {circle_duration:.1f} s | Waypoints: {len(targets)}"
+        )
+        print(f"Safety Z floor: {safe_z_min_mm:.1f} mm")
+    else:
+        print(
+            f"Square side: {side_mm:.1f} mm | Steps/edge: {steps_per_edge} | "
+            f"Locations: {num_locations} | Waypoints: {len(targets)}"
+        )
+        print(
+            f"Safety Z floor: {safe_z_min_mm:.1f} mm | Location spacing: {location_step_mm:.1f} mm | "
+            f"Region loops: {region_loops}"
+        )
     print("Comparison:")
     print("  WITHOUT IK  = DNN-only output")
     print("  WITH IK     = DNN output + Newton refinement")
@@ -331,11 +393,15 @@ def run_demo(
 
     pub = None
     if send_to_robot:
-        print("WARNING: Sending IK waypoints to the real robot. Make sure the workspace is clear.")
+        if trajectory == "circle":
+            print("WARNING: Sending a 10-second circular trajectory to the robot. Make sure the workspace is clear.")
+        else:
+            print("WARNING: Sending IK waypoints to the real robot. Make sure the workspace is clear.")
         pub = make_robot_publisher(topic="/scaled_pos_joint_traj_controller/command")
 
     q_seed = q_center.copy()
     q_seed_ctrl = q_center.copy()
+    q_trajectory: list[np.ndarray] = []
     results: list[WaypointResult] = []
     start = time.time()
 
@@ -363,7 +429,12 @@ def run_demo(
             eps_w_rad=0.01,
         )
 
-        if send_to_robot:
+        if trajectory == "circle":
+            if ok_ref:
+                q_trajectory.append(q_ref.copy())
+            else:
+                print(f"[circle] waypoint {i:02d}: refinement failed, skipping point")
+        elif send_to_robot:
             if ok_ref:
                 q_print = [float(v) for v in np.asarray(q_ref).flatten().tolist()]
                 print(f"[robot] waypoint {i:02d}: publishing q_ref = {q_print}")
@@ -432,6 +503,14 @@ def run_demo(
     print(f"    Mean iterations (Newton): {np.mean(its_ctrl):.1f}")
     print(f"  Elapsed: {elapsed:.2f}s")
 
+    if trajectory == "circle" and send_to_robot:
+        if q_trajectory:
+            print(f"\n[robot] publishing smooth circular trajectory with {len(q_trajectory)} points over {circle_duration:.1f}s")
+            send_joint_trajectory(pub, q_trajectory, total_duration=circle_duration)
+            rospy.sleep(circle_duration + 0.5)
+        else:
+            print("\nWARN: Circle mode produced no valid IK-refined points to send.")
+
     if np.all(conv_ref) and np.all(conv_ctrl):
         print("\nPASS: Trajectory verified for WITHOUT IK, WITH IK, and CONTROL (pure IK).")
         return 0
@@ -447,8 +526,17 @@ def parse_args() -> argparse.Namespace:
         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ik_v3", "results"),
         help="Path containing model_best.pt, pose_scaler.pkl, seed_scaler.pkl",
     )
+    parser.add_argument(
+        "--trajectory",
+        choices=["square", "circle"],
+        default="square",
+        help="Cartesian trajectory family to generate",
+    )
     parser.add_argument("--side_mm", type=float, default=20.0, help="Square side length in mm")
     parser.add_argument("--steps_per_edge", type=int, default=6, help="Waypoints per edge")
+    parser.add_argument("--circle_radius_mm", type=float, default=20.0, help="Circle radius in mm")
+    parser.add_argument("--circle_duration", type=float, default=10.0, help="Total duration for the circular robot motion")
+    parser.add_argument("--circle_points", type=int, default=40, help="Number of circle segments (final point closes the loop)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--safe_z_min_mm", type=float, default=120.0, help="Minimum tool Z (mm) for target generation")
     parser.add_argument("--location_step_mm", type=float, default=40.0, help="XY spacing (mm) between square centers")
@@ -463,6 +551,11 @@ def parse_args() -> argparse.Namespace:
         "--send_to_robot",
         action="store_true",
         help="Publish refined IK waypoints to /scaled_pos_joint_traj_controller/command",
+    )
+    parser.add_argument(
+        "--allow_large_motion",
+        action="store_true",
+        help="Allow circle radius above the default safety threshold",
     )
     parser.add_argument(
         "--move_duration",
@@ -481,6 +574,9 @@ def main() -> int:
     if args.send_to_robot and rospy is None:
         print(f"ERROR: --send_to_robot was requested but ROS imports are unavailable: {ROS_IMPORT_ERROR}")
         return 2
+    if args.trajectory == "circle" and args.circle_radius_mm > 50.0 and not args.allow_large_motion:
+        print("ERROR: circle_radius_mm > 50 requires --allow_large_motion")
+        return 2
     required = ["model_best.pt", "pose_scaler.pkl", "seed_scaler.pkl"]
     missing = [name for name in required if not os.path.exists(os.path.join(args.model_dir, name))]
     if missing:
@@ -488,13 +584,18 @@ def main() -> int:
         return 2
     return run_demo(
         model_dir=args.model_dir,
+        trajectory=args.trajectory,
         side_mm=args.side_mm,
         steps_per_edge=args.steps_per_edge,
+        circle_radius_mm=args.circle_radius_mm,
+        circle_duration=args.circle_duration,
+        circle_points=args.circle_points,
         seed=args.seed,
         safe_z_min_mm=args.safe_z_min_mm,
         location_step_mm=args.location_step_mm,
         num_locations=args.num_locations,
         region_loops=args.region_loops,
+        allow_large_motion=args.allow_large_motion,
         send_to_robot=args.send_to_robot,
         move_duration=args.move_duration,
     )
